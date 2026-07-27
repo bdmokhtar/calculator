@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>EARN // HOLOGRID</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --bg:#050811;
@@ -72,6 +73,11 @@
   .group-card .gdel:hover{color:var(--magenta);opacity:1;}
 
   .add-group{margin-top:12px;display:flex;flex-direction:column;gap:8px;}
+  .cloud-box{margin-top:14px;padding-top:12px;border-top:1px dashed var(--border);display:flex;flex-direction:column;}
+  .cloud-title{font-size:10.5px;letter-spacing:2px;color:var(--text-dim);text-transform:uppercase;margin-bottom:6px;}
+  .cloud-status{font-size:11.5px;color:var(--text-dim);}
+  .cloud-status.on{color:var(--green);}
+  .cloud-status.warn{color:var(--amber);}
   .swatches{display:flex;gap:6px;}
   .swatch{width:20px;height:20px;border-radius:50%;cursor:pointer;border:2px solid transparent;flex:none;}
   .swatch.sel{border-color:#fff;}
@@ -153,6 +159,16 @@
         <div class="swatches" id="swatches"></div>
         <button class="btn" id="addGroupBtn">+ Add Group</button>
       </div>
+      <div class="cloud-box" id="cloudBox">
+        <div class="cloud-title">Cloud Backup</div>
+        <div class="cloud-status" id="cloudStatus">Not connected</div>
+        <button class="btn small" id="googleSignInBtn" style="width:100%;margin-top:8px;">Sign in with Google</button>
+        <div id="cloudSignedInActions" style="display:none;flex-direction:column;gap:6px;margin-top:8px;">
+          <button class="btn small" id="cloudBackupBtn" style="width:100%;">☁ Backup Now</button>
+          <button class="btn ghost small" id="cloudRestoreBtn" style="width:100%;">↺ Restore from Drive</button>
+          <button class="btn ghost small" id="cloudSignOutBtn" style="width:100%;">Sign Out</button>
+        </div>
+      </div>
     </div>
 
     <div class="panel panel-pad" id="mainPanel">
@@ -163,24 +179,29 @@
 
 <script>
 (function(){
-  // ---------- storage layer (persistent, falls back to memory) ----------
+  // ---------- storage layer: localStorage (real persistence when hosted), ----------
+  // ---------- window.storage used opportunistically if present, memory as last resort ----------
   const memStore = {};
-  const hasStorage = typeof window.storage !== 'undefined';
+  const hasArtifactStorage = typeof window.storage !== 'undefined';
+  const hasLocalStorage = (function(){ try{ localStorage.setItem('__t','1'); localStorage.removeItem('__t'); return true; }catch(e){ return false; } })();
+  const LS_PREFIX = 'earn_hologrid:';
+
   async function sGet(key){
     try{
-      if(hasStorage){ const r = await window.storage.get(key,false); return r ? r.value : null; }
-      return memStore[key] !== undefined ? memStore[key] : null;
-    }catch(e){ return memStore[key] !== undefined ? memStore[key] : null; }
+      if(hasArtifactStorage){ const r = await window.storage.get(key,false); if(r) return r.value; }
+    }catch(e){}
+    if(hasLocalStorage){ const v = localStorage.getItem(LS_PREFIX+key); if(v!==null) return v; }
+    return memStore[key] !== undefined ? memStore[key] : null;
   }
   async function sSet(key,value){
-    try{
-      if(hasStorage){ await window.storage.set(key,value,false); }
-      memStore[key] = value;
-    }catch(e){ memStore[key] = value; }
+    try{ if(hasArtifactStorage){ await window.storage.set(key,value,false); } }catch(e){}
+    try{ if(hasLocalStorage){ localStorage.setItem(LS_PREFIX+key, value); } }catch(e){}
+    memStore[key] = value;
   }
   async function sDelete(key){
-    try{ if(hasStorage){ await window.storage.delete(key,false); } delete memStore[key]; }
-    catch(e){ delete memStore[key]; }
+    try{ if(hasArtifactStorage){ await window.storage.delete(key,false); } }catch(e){}
+    try{ if(hasLocalStorage){ localStorage.removeItem(LS_PREFIX+key); } }catch(e){}
+    delete memStore[key];
   }
 
   const COLORS = [
@@ -204,7 +225,7 @@
     const raw = await sGet('groups');
     groups = raw ? JSON.parse(raw) : [];
   }
-  async function saveGroups(){ await sSet('groups', JSON.stringify(groups)); }
+  async function saveGroups(){ await sSet('groups', JSON.stringify(groups)); scheduleAutoSync(); }
 
   async function loadEntries(groupId){
     if(entriesCache[groupId]) return entriesCache[groupId];
@@ -215,6 +236,7 @@
   }
   async function saveEntries(groupId){
     await sSet('entries:'+groupId, JSON.stringify(entriesCache[groupId]||[]));
+    scheduleAutoSync();
   }
 
   function groupTotal(groupId){
@@ -497,9 +519,198 @@
     if(e.key==='Enter') document.getElementById('addGroupBtn').click();
   });
 
+  // ---------- backup payload helpers (used by cloud backup) ----------
+  async function buildBackupPayload(){
+    const payload = { app:'earn-hologrid-backup', version:1, exportedAt:new Date().toISOString(), groups, entries:{} };
+    for(const g of groups){ payload.entries[g.id] = entriesCache[g.id] || (await loadEntries(g.id)); }
+    return payload;
+  }
+
+  async function restorePayload(data){
+    if(!data || !Array.isArray(data.groups) || typeof data.entries !== 'object'){
+      throw new Error('Invalid backup payload');
+    }
+    groups = data.groups;
+    await saveGroups();
+    entriesCache = {};
+    for(const g of groups){
+      const arr = data.entries[g.id] || [];
+      entriesCache[g.id] = arr;
+      await saveEntries(g.id);
+    }
+    currentGroupId = groups[0] ? groups[0].id : null;
+    renderGroupsList();
+    renderMain();
+    renderGrandTotal();
+  }
+
+  // ---------- cloud backup: Google Sign-In + Google Drive ----------
+  // SETUP REQUIRED: paste your own OAuth Client ID below (see comment at bottom of file for steps).
+  const GOOGLE_CLIENT_ID = "899137729290-jc8mnd8cng95k30hi2fgq5gkf2cgno8m.apps.googleusercontent.com";
+  const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+  const BACKUP_FILENAME = "earn_hologrid_backup.json";
+
+  let gAccessToken = null;
+  let gDriveFileId = null;
+  let gTokenClient = null;
+  let gAutoSyncTimer = null;
+
+  function cloudConfigured(){ return GOOGLE_CLIENT_ID.indexOf('REPLACE_WITH') === -1; }
+
+  function setCloudStatus(text, mode){
+    const el = document.getElementById('cloudStatus');
+    el.textContent = text;
+    el.className = 'cloud-status' + (mode ? ' '+mode : '');
+  }
+
+  function waitForGoogleLib(cb){
+    if(window.google && window.google.accounts && window.google.accounts.oauth2){ cb(); }
+    else setTimeout(()=>waitForGoogleLib(cb), 250);
+  }
+
+  function initCloud(){
+    const signInBtn = document.getElementById('googleSignInBtn');
+    if(!cloudConfigured()){
+      setCloudStatus('Not set up yet — add your Google Client ID in the code (see instructions).', 'warn');
+      signInBtn.disabled = true;
+      signInBtn.textContent = 'Google Client ID not configured';
+      return;
+    }
+    waitForGoogleLib(()=>{
+      gTokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: DRIVE_SCOPE,
+        callback: async (resp)=>{
+          if(resp.error){ setCloudStatus('Sign-in failed: '+resp.error, 'warn'); return; }
+          gAccessToken = resp.access_token;
+          await onCloudSignedIn();
+        }
+      });
+      signInBtn.disabled = false;
+    });
+  }
+
+  async function driveApiFetch(url, opts){
+    opts = opts || {};
+    opts.headers = Object.assign({'Authorization':'Bearer '+gAccessToken}, opts.headers||{});
+    const res = await fetch(url, opts);
+    if(!res.ok){ const t = await res.text(); throw new Error('Drive API error: '+res.status+' '+t); }
+    return res;
+  }
+
+  async function driveFindBackupFile(){
+    const q = encodeURIComponent(`name='${BACKUP_FILENAME}' and trashed=false`);
+    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`);
+    const data = await res.json();
+    return (data.files && data.files[0]) || null;
+  }
+
+  async function driveCreateBackupFile(contentStr){
+    const boundary = 'earnhologrid_boundary_314159';
+    const metadata = {name: BACKUP_FILENAME, mimeType:'application/json'};
+    const body =
+      `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+      `--${boundary}\r\nContent-Type: application/json\r\n\r\n${contentStr}\r\n` +
+      `--${boundary}--`;
+    const res = await driveApiFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method:'POST',
+      headers:{'Content-Type':`multipart/related; boundary=${boundary}`},
+      body
+    });
+    const data = await res.json();
+    return data.id;
+  }
+
+  async function driveUpdateBackupFile(fileId, contentStr){
+    await driveApiFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+      method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body: contentStr
+    });
+  }
+
+  async function driveDownloadBackupFile(fileId){
+    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+    return await res.text();
+  }
+
+  async function onCloudSignedIn(){
+    setCloudStatus('Connected — checking Drive for a backup…', 'on');
+    document.getElementById('googleSignInBtn').style.display = 'none';
+    document.getElementById('cloudSignedInActions').style.display = 'flex';
+    try{
+      const existing = await driveFindBackupFile();
+      if(existing){
+        gDriveFileId = existing.id;
+        setCloudStatus('Connected — backup found (updated '+new Date(existing.modifiedTime).toLocaleString()+').', 'on');
+      } else {
+        gDriveFileId = null;
+        setCloudStatus('Connected — no backup on Drive yet. Click "Backup Now".', 'on');
+      }
+    }catch(e){
+      setCloudStatus('Connected, but could not reach Drive: '+e.message, 'warn');
+    }
+  }
+
+  async function cloudBackupNow(){
+    if(!gAccessToken){ return; }
+    setCloudStatus('Backing up to Drive…', 'on');
+    try{
+      const payload = await buildBackupPayload();
+      const contentStr = JSON.stringify(payload, null, 2);
+      if(gDriveFileId){
+        await driveUpdateBackupFile(gDriveFileId, contentStr);
+      } else {
+        gDriveFileId = await driveCreateBackupFile(contentStr);
+      }
+      setCloudStatus('Backed up to Drive at '+new Date().toLocaleTimeString()+'.', 'on');
+    }catch(e){
+      setCloudStatus('Backup failed: '+e.message, 'warn');
+    }
+  }
+
+  async function cloudRestoreNow(){
+    if(!gAccessToken) return;
+    try{
+      const existing = gDriveFileId ? {id:gDriveFileId} : await driveFindBackupFile();
+      if(!existing){ setCloudStatus('No backup found on Drive.', 'warn'); return; }
+      if(!confirm('Restore from Google Drive will replace your current groups and entries. Continue?')) return;
+      const text = await driveDownloadBackupFile(existing.id);
+      const data = JSON.parse(text);
+      await restorePayload(data);
+      gDriveFileId = existing.id;
+      setCloudStatus('Restored from Drive successfully.', 'on');
+    }catch(e){
+      setCloudStatus('Restore failed: '+e.message, 'warn');
+    }
+  }
+
+  function cloudSignOut(){
+    try{ if(gAccessToken && google.accounts && google.accounts.oauth2){ google.accounts.oauth2.revoke(gAccessToken, ()=>{}); } }catch(e){}
+    gAccessToken = null; gDriveFileId = null;
+    document.getElementById('googleSignInBtn').style.display = 'block';
+    document.getElementById('cloudSignedInActions').style.display = 'none';
+    setCloudStatus('Not connected');
+  }
+
+  function scheduleAutoSync(){
+    if(!gAccessToken) return;
+    clearTimeout(gAutoSyncTimer);
+    gAutoSyncTimer = setTimeout(cloudBackupNow, 2500);
+  }
+
+  document.getElementById('googleSignInBtn').onclick = ()=>{
+    if(!gTokenClient) return;
+    gTokenClient.requestAccessToken({prompt:'consent'});
+  };
+  document.getElementById('cloudBackupBtn').onclick = cloudBackupNow;
+  document.getElementById('cloudRestoreBtn').onclick = cloudRestoreNow;
+  document.getElementById('cloudSignOutBtn').onclick = cloudSignOut;
+
   // ---------- init ----------
   async function init(){
     renderSwatches();
+    initCloud();
     await loadGroups();
     if(groups.length){
       currentGroupId = groups[0].id;
@@ -513,5 +724,28 @@
   init();
 })();
 </script>
+<!--
+  ============================================================
+  HOW TO ENABLE GOOGLE DRIVE CLOUD BACKUP (one-time setup)
+  ============================================================
+  1. Go to https://console.cloud.google.com/ and create a project (or use an existing one).
+  2. Enable the "Google Drive API" for that project (APIs & Services > Library).
+  3. Go to APIs & Services > Credentials > Create Credentials > OAuth client ID.
+     - Application type: "Web application"
+     - Authorized JavaScript origins: add your GitHub Pages URL, e.g.
+       https://yourusername.github.io
+     - Save, then copy the generated Client ID (ends with .apps.googleusercontent.com).
+  4. In this file, find the line:
+       const GOOGLE_CLIENT_ID = "REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+     and paste your Client ID in place of the placeholder text.
+  5. Also set up the OAuth consent screen (APIs & Services > OAuth consent screen):
+     - You can leave it in "Testing" mode and add your own Google account as a test user,
+       which is enough for personal use.
+  6. Push this file to GitHub and open it via your GitHub Pages URL (not as a local file://,
+     Google Sign-In requires a real http/https origin that matches step 3).
+  Once configured, "Sign in with Google" will appear active, and the app will keep a
+  backup file named "earn_hologrid_backup.json" in your Google Drive (created via the
+  drive.file scope, so this app can only see files it created — not your whole Drive).
+-->
 </body>
 </html>
